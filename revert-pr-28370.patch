@@ -1,0 +1,229 @@
+diff --git a/src/resolve/resolved-etc-hosts.c b/src/resolve/resolved-etc-hosts.c
+index 6af160a477..6acae48c2b 100644
+--- a/src/resolve/resolved-etc-hosts.c
++++ b/src/resolve/resolved-etc-hosts.c
+@@ -189,18 +189,9 @@ static int parse_line(EtcHosts *hosts, unsigned nr, const char *line) {
+                                 return log_oom();
+                 }
+ 
+-                r = set_ensure_put(&item->names, &dns_name_hash_ops_free, name);
++                r = set_ensure_consume(&item->names, &dns_name_hash_ops_free, TAKE_PTR(name));
+                 if (r < 0)
+                         return log_oom();
+-                if (r == 0) /* the name is already listed */
+-                        continue;
+-                /*
+-                 * Keep track of the first name listed for this address.
+-                 * This name will be used in responses as the canonical name.
+-                 */
+-                if (!item->canonical_name)
+-                        item->canonical_name = name;
+-                TAKE_PTR(name);
+         }
+ 
+         if (!found)
+@@ -381,45 +372,6 @@ static int manager_etc_hosts_read(Manager *m) {
+         return 1;
+ }
+ 
+-static int answer_add_ptr(DnsAnswer *answer, DnsResourceKey *key, const char *name) {
+-        _cleanup_(dns_resource_record_unrefp) DnsResourceRecord *rr = NULL;
+-
+-        rr = dns_resource_record_new(key);
+-        if (!rr)
+-                return -ENOMEM;
+-
+-        rr->ptr.name = strdup(name);
+-        if (!rr->ptr.name)
+-                return -ENOMEM;
+-
+-        return dns_answer_add(answer, rr, 0, DNS_ANSWER_AUTHENTICATED, NULL);
+-}
+-
+-static int answer_add_cname(DnsAnswer *answer, const char *name, const char *cname) {
+-        _cleanup_(dns_resource_record_unrefp) DnsResourceRecord *rr = NULL;
+-
+-        rr = dns_resource_record_new_full(DNS_CLASS_IN, DNS_TYPE_CNAME, name);
+-        if (!rr)
+-                return -ENOMEM;
+-
+-        rr->cname.name = strdup(cname);
+-        if (!rr->cname.name)
+-                return -ENOMEM;
+-
+-        return dns_answer_add(answer, rr, 0, DNS_ANSWER_AUTHENTICATED, NULL);
+-}
+-
+-static int answer_add_addr(DnsAnswer *answer, const char *name, const struct in_addr_data *a) {
+-        _cleanup_(dns_resource_record_unrefp) DnsResourceRecord *rr = NULL;
+-        int r;
+-
+-        r = dns_resource_record_new_address(&rr, a->family, &a->address, name);
+-        if (r < 0)
+-                return r;
+-
+-        return dns_answer_add(answer, rr, 0, DNS_ANSWER_AUTHENTICATED, NULL);
+-}
+-
+ static int etc_hosts_lookup_by_address(
+                 EtcHosts *hosts,
+                 DnsQuestion *q,
+@@ -466,17 +418,18 @@ static int etc_hosts_lookup_by_address(
+                 if (r < 0)
+                         return r;
+ 
+-                if (item->canonical_name) {
+-                        r = answer_add_ptr(*answer, found_ptr, item->canonical_name);
+-                        if (r < 0)
+-                                return r;
+-                }
+-
+                 SET_FOREACH(n, item->names) {
+-                        if (n == item->canonical_name)
+-                                continue;
++                        _cleanup_(dns_resource_record_unrefp) DnsResourceRecord *rr = NULL;
++
++                        rr = dns_resource_record_new(found_ptr);
++                        if (!rr)
++                                return -ENOMEM;
+ 
+-                        r = answer_add_ptr(*answer, found_ptr, n);
++                        rr->ptr.name = strdup(n);
++                        if (!rr->ptr.name)
++                                return -ENOMEM;
++
++                        r = dns_answer_add(*answer, rr, 0, DNS_ANSWER_AUTHENTICATED, NULL);
+                         if (r < 0)
+                                 return r;
+                 }
+@@ -535,26 +488,17 @@ static int etc_hosts_lookup_by_name(
+         }
+ 
+         SET_FOREACH(a, item ? item->addresses : NULL) {
+-                EtcHostsItemByAddress *item_by_addr;
+-                const char *canonical_name;
++                _cleanup_(dns_resource_record_unrefp) DnsResourceRecord *rr = NULL;
+ 
+                 if ((!found_a && a->family == AF_INET) ||
+                     (!found_aaaa && a->family == AF_INET6))
+                         continue;
+ 
+-                item_by_addr = hashmap_get(hosts->by_address, a);
+-                if (item_by_addr && item_by_addr->canonical_name)
+-                        canonical_name = item_by_addr->canonical_name;
+-                else
+-                        canonical_name = item->name;
+-
+-                if (!streq(item->name, canonical_name)) {
+-                        r = answer_add_cname(*answer, item->name, canonical_name);
+-                        if (r < 0)
+-                                return r;
+-                }
++                r = dns_resource_record_new_address(&rr, a->family, &a->address, item->name);
++                if (r < 0)
++                        return r;
+ 
+-                r = answer_add_addr(*answer, canonical_name, a);
++                r = dns_answer_add(*answer, rr, 0, DNS_ANSWER_AUTHENTICATED, NULL);
+                 if (r < 0)
+                         return r;
+         }
+diff --git a/src/resolve/resolved-etc-hosts.h b/src/resolve/resolved-etc-hosts.h
+index 805a09bb6d..e1a7249f29 100644
+--- a/src/resolve/resolved-etc-hosts.h
++++ b/src/resolve/resolved-etc-hosts.h
+@@ -8,7 +8,6 @@
+ typedef struct EtcHostsItemByAddress {
+         struct in_addr_data address;
+         Set *names;
+-        const char *canonical_name;
+ } EtcHostsItemByAddress;
+ 
+ typedef struct EtcHostsItemByName {
+diff --git a/src/resolve/test-resolved-etc-hosts.c b/src/resolve/test-resolved-etc-hosts.c
+index 75f7db3482..d46dbd3000 100644
+--- a/src/resolve/test-resolved-etc-hosts.c
++++ b/src/resolve/test-resolved-etc-hosts.c
+@@ -27,17 +27,11 @@ TEST(parse_etc_hosts_system) {
+         assert_se(etc_hosts_parse(&hosts, f) == 0);
+ }
+ 
+-#define in_addr_4(_address_str)                                       \
+-        (&(struct in_addr_data) { .family = AF_INET, .address.in = { .s_addr = inet_addr(_address_str) } })
+-
+-#define in_addr_6(...)                                           \
+-        (&(struct in_addr_data) { .family = AF_INET6, .address.in6 = { .s6_addr = __VA_ARGS__ } })
+-
+ #define has_4(_set, _address_str)                                       \
+-        set_contains(_set, in_addr_4(_address_str))
++        set_contains(_set, &(struct in_addr_data) { .family = AF_INET, .address.in = { .s_addr = inet_addr(_address_str) } })
+ 
+ #define has_6(_set, ...)                                           \
+-        set_contains(_set, in_addr_6(__VA_ARGS__))
++        set_contains(_set, &(struct in_addr_data) { .family = AF_INET6, .address.in6 = { .s6_addr = __VA_ARGS__ } })
+ 
+ TEST(parse_etc_hosts) {
+         _cleanup_(unlink_tempfilep) char
+@@ -116,20 +110,6 @@ TEST(parse_etc_hosts) {
+         assert_se(set_size(bn->addresses) == 1);
+         assert_se(has_6(bn->addresses, {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 5}));
+ 
+-        EtcHostsItemByAddress *ba;
+-        assert_se(ba = hashmap_get(hosts.by_address, in_addr_4("1.2.3.6")));
+-        assert_se(set_size(ba->names) == 2);
+-        assert_se(set_contains(ba->names, "dash"));
+-        assert_se(set_contains(ba->names, "dash-dash.where-dash"));
+-        assert_se(streq(ba->canonical_name, "dash"));
+-
+-        assert_se(ba = hashmap_get(hosts.by_address, in_addr_6({0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 5})));
+-        assert_se(set_size(ba->names) == 3);
+-        assert_se(set_contains(ba->names, "some.where"));
+-        assert_se(set_contains(ba->names, "some.other"));
+-        assert_se(set_contains(ba->names, "foobar.foo.foo"));
+-        assert_se(streq(ba->canonical_name, "some.where"));
+-
+         assert_se( set_contains(hosts.no_address, "some.where"));
+         assert_se( set_contains(hosts.no_address, "some.other"));
+         assert_se( set_contains(hosts.no_address, "deny.listed"));
+diff --git a/test/units/testsuite-75.sh b/test/units/testsuite-75.sh
+index 5445c152c9..ef0e42a81d 100755
+--- a/test/units/testsuite-75.sh
++++ b/test/units/testsuite-75.sh
+@@ -160,12 +160,10 @@ ip link del hoge.foo
+ ### SETUP ###
+ # Configure network
+ hostnamectl hostname ns1.unsigned.test
+-cat >>/etc/hosts <<EOF
+-10.0.0.1               ns1.unsigned.test
+-fd00:dead:beef:cafe::1 ns1.unsigned.test
+-
+-127.128.0.5     localhost5 localhost5.localdomain localhost5.localdomain4 localhost.localdomain5 localhost5.localdomain5
+-EOF
++{
++    echo "10.0.0.1               ns1.unsigned.test"
++    echo "fd00:dead:beef:cafe::1 ns1.unsigned.test"
++} >>/etc/hosts
+ 
+ mkdir -p /etc/systemd/network
+ cat >/etc/systemd/network/dns0.netdev <<EOF
+@@ -295,20 +293,6 @@ run getent -s myhostname hosts localhost
+ grep -qE "^127\.0\.0\.1\s+localhost" "$RUN_OUT"
+ enable_ipv6
+ 
+-# Issue: https://github.com/systemd/systemd/issues/25088
+-run getent -s resolve hosts 127.128.0.5
+-grep -qEx '127\.128\.0\.5\s+localhost5(\s+localhost5?\.localdomain[45]?){4}' "$RUN_OUT"
+-[ "$(wc -l <"$RUN_OUT")" -eq 1 ]
+-
+-# Issue: https://github.com/systemd/systemd/issues/20158
+-run dig +noall +answer +additional localhost5.
+-grep -qEx 'localhost5\.\s+0\s+IN\s+A\s+127\.128\.0\.5' "$RUN_OUT"
+-[ "$(wc -l <"$RUN_OUT")" -eq 1 ]
+-run dig +noall +answer +additional localhost5.localdomain4.
+-grep -qEx 'localhost5\.localdomain4\.\s+0\s+IN\s+CNAME\s+localhost5\.' "$RUN_OUT"
+-grep -qEx 'localhost5\.\s+0\s+IN\s+A\s+127\.128\.0\.5' "$RUN_OUT"
+-[ "$(wc -l <"$RUN_OUT")" -eq 2 ]
+-
+ : "--- Basic resolved tests ---"
+ # Issue: https://github.com/systemd/systemd/issues/22229
+ # PR: https://github.com/systemd/systemd/pull/22231
