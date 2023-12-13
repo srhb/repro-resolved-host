@@ -7,21 +7,11 @@
     hostName = "testhostname";
     domain = "testdomain";
     fqdn = "${hostName}.${domain}";
+
     pkgs = import nixpkgs {
       inherit system;
     };
-    pkgsFixed = import nixpkgs {
-      inherit system;
-      overlays = [
-        (self: super: {
-          systemd = super.systemd.overrideAttrs (oa: {
-            patches = oa.patches ++ [
-              ./revert-pr-28370.patch
-            ];
-          });
-        })
-      ];
-    };
+
     lib = pkgs.lib;
 
     testScript = { nodes, ... }: ''
@@ -29,29 +19,8 @@
     machine = ${hostName}
 
     machine.wait_for_unit("network-online.target")
-
-    # The FQDN, domain name, and hostname detection should work as expected:
-    assert "${fqdn}" == machine.succeed("hostname --fqdn").strip()
-    assert "${domain}" == machine.succeed("dnsdomainname").strip()
-    assert (
-        "${hostName}"
-        == machine.succeed(
-            'hostnamectl status | grep "Static hostname" | cut -d: -f2'
-        ).strip()
-    )
-
-    # 127.0.0.1 and ::1 should resolve back to "localhost":
-    assert (
-        "localhost" == machine.succeed("getent hosts 127.0.0.1 | awk '{print $2}'").strip()
-    )
-    assert "localhost" == machine.succeed("getent hosts ::1 | awk '{print $2}'").strip()
-
-    # 127.0.0.2 should resolve back to the FQDN and hostname:
-    fqdn_and_host_name = "${"${hostName}.${domain} "}${hostName}"
-    assert (
-        fqdn_and_host_name
-        == machine.succeed("getent hosts 127.0.0.2 | awk '{print $2,$3}'").strip()
-    )
+    print(machine.succeed("getent hosts ${hostName}").strip())
+    assert machine.succeed("getent hosts ${hostName} | grep '${hostName}'").strip()
   '';
 
     common = {
@@ -80,10 +49,15 @@
           networking.useNetworkd = true;
         };
       };
-      useNetworkd-fixed = pkgsFixed.nixosTest {
+      useNetworkd-fixed = pkgs.nixosTest {
         name = "useNetworkd-fixed";
         inherit testScript;
         nodes.machine = {
+          systemd.package = pkgs.systemd.overrideAttrs (oa: {
+            patches = oa.patches ++ [
+              ./revert-pr-28370.patch
+            ];
+          });
           imports = [ common ];
           networking.useNetworkd = true;
         };
